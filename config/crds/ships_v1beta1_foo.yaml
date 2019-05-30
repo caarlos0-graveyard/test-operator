@@ -6,11 +6,17 @@ metadata:
     controller-tools.k8s.io: "1.0"
   name: foos.ships.k8s.io
 spec:
+  additionalPrinterColumns:
+  - JSONPath: .status.status
+    name: Status
+    type: string
   group: ships.k8s.io
   names:
     kind: Foo
     plural: foos
   scope: Namespaced
+  subresources:
+    status: {}
   validation:
     openAPIV3Schema:
       properties:
@@ -27,8 +33,23 @@ spec:
         metadata:
           type: object
         spec:
+          properties:
+            image:
+              description: 'INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
+                Important: Run "make" to regenerate code after modifying this file'
+              type: string
+          required:
+          - image
           type: object
         status:
+          properties:
+            status:
+              description: 'INSERT ADDITIONAL STATUS FIELD - define observed state
+                of cluster Important: Run "make" to regenerate code after modifying
+                this file'
+              type: string
+          required:
+          - status
           type: object
   version: v1beta1
 status:

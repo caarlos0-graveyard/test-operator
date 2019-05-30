@@ -18,10 +18,9 @@ package foo
 
 import (
 	"context"
-	"reflect"
 
 	shipsv1beta1 "github.com/caarlos0/test-operator/pkg/apis/ships/v1beta1"
-	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -69,16 +68,19 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 		return err
 	}
 
-	// TODO(user): Modify this to be the types you create
-	// Uncomment watch a Deployment created by Foo - change this for objects you create
-	err = c.Watch(&source.Kind{Type: &appsv1.Deployment{}}, &handler.EnqueueRequestForOwner{
-		IsController: true,
-		OwnerType:    &shipsv1beta1.Foo{},
-	})
-	if err != nil {
-		return err
+	// watch all types we create...
+	for _, t := range []runtime.Object{
+		&batchv1.Job{},
+		&corev1.Pod{},
+	} {
+		err = c.Watch(&source.Kind{Type: t}, &handler.EnqueueRequestForOwner{
+			IsController: true,
+			OwnerType:    &shipsv1beta1.Foo{},
+		})
+		if err != nil {
+			return err
+		}
 	}
-
 	return nil
 }
 
@@ -90,13 +92,9 @@ type ReconcileFoo struct {
 	scheme *runtime.Scheme
 }
 
-// Reconcile reads that state of the cluster for a Foo object and makes changes based on the state read
-// and what is in the Foo.Spec
-// TODO(user): Modify this Reconcile function to implement your Controller logic.  The scaffolding writes
-// a Deployment as an example
-// Automatically generate RBAC rules to allow the Controller to read and write Deployments
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get
+// +kubebuilder:rbac:groups=,resources=pods,verbs=get;watch
 // +kubebuilder:rbac:groups=ships.k8s.io,resources=foos,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=ships.k8s.io,resources=foos/status,verbs=get;update;patch
 func (r *ReconcileFoo) Reconcile(request reconcile.Request) (reconcile.Result, error) {
@@ -113,55 +111,123 @@ func (r *ReconcileFoo) Reconcile(request reconcile.Request) (reconcile.Result, e
 		return reconcile.Result{}, err
 	}
 
-	// TODO(user): Change this to be the object type created by your controller
-	// Define the desired Deployment object
-	deploy := &appsv1.Deployment{
+	type reconcilerFn func(instance *shipsv1beta1.Foo) (reconcile.Result, error)
+
+	for _, fn := range []reconcilerFn{
+		r.reconcileJob,
+		r.reconcileStatus,
+	} {
+		if result, err := fn(instance); err != nil {
+			return result, err
+		}
+	}
+	return reconcile.Result{}, nil
+}
+
+func (r *ReconcileFoo) reconcileJob(instance *shipsv1beta1.Foo) (reconcile.Result, error) {
+	var backoff int32
+	var job = &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      instance.Name + "-deployment",
+			Name:      instance.Name,
 			Namespace: instance.Namespace,
+			Labels:    instance.Labels,
 		},
-		Spec: appsv1.DeploymentSpec{
-			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{"deployment": instance.Name + "-deployment"},
-			},
+		Spec: batchv1.JobSpec{
+			BackoffLimit: &backoff,
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"deployment": instance.Name + "-deployment"}},
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: instance.Labels,
+				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:  "nginx",
-							Image: "nginx",
+							Name:  instance.Name,
+							Image: instance.Spec.Image,
 						},
 					},
+					RestartPolicy: corev1.RestartPolicyNever,
 				},
 			},
 		},
 	}
-	if err := controllerutil.SetControllerReference(instance, deploy, r.scheme); err != nil {
+	if err := controllerutil.SetControllerReference(instance, job, r.scheme); err != nil {
 		return reconcile.Result{}, err
 	}
 
-	// TODO(user): Change this for the object type created by your controller
-	// Check if the Deployment already exists
-	found := &appsv1.Deployment{}
-	err = r.Get(context.TODO(), types.NamespacedName{Name: deploy.Name, Namespace: deploy.Namespace}, found)
+	var found = &batchv1.Job{}
+	var err = r.Get(context.TODO(), types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, found)
 	if err != nil && errors.IsNotFound(err) {
-		log.Info("Creating Deployment", "namespace", deploy.Namespace, "name", deploy.Name)
-		err = r.Create(context.TODO(), deploy)
+		log.Info("Creating Job", "namespace", job.Namespace, "name", job.Name)
+		err = r.Create(context.TODO(), job)
 		return reconcile.Result{}, err
 	} else if err != nil {
 		return reconcile.Result{}, err
 	}
+	return reconcile.Result{}, nil
+}
 
-	// TODO(user): Change this for the object type created by your controller
-	// Update the found object and write the result back if there are any changes
-	if !reflect.DeepEqual(deploy.Spec, found.Spec) {
-		found.Spec = deploy.Spec
-		log.Info("Updating Deployment", "namespace", deploy.Namespace, "name", deploy.Name)
-		err = r.Update(context.TODO(), found)
-		if err != nil {
-			return reconcile.Result{}, err
+func (r *ReconcileFoo) reconcileStatus(instance *shipsv1beta1.Foo) (reconcile.Result, error) {
+	log.Info(
+		"Will try to update Foo status based on job and pod",
+		"namespace", instance.Namespace,
+		"name", instance.Name,
+	)
+
+	var found = &batchv1.Job{}
+	if err := r.Get(context.TODO(), types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, found); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	for _, cond := range found.Status.Conditions {
+		if cond.Status == corev1.ConditionFalse {
+			continue
+		}
+		switch cond.Type {
+		case batchv1.JobComplete:
+			instance.Status.Status = string(batchv1.JobComplete)
+		case batchv1.JobFailed:
+			instance.Status.Status = string(batchv1.JobFailed)
+		}
+		break
+	}
+
+	if instance.Status.Status != "" {
+		// means its either done or failed
+		return reconcile.Result{}, nil
+	}
+	// otherwise its still running or trying to run, try to get pod status:
+
+	// set to unknown first
+	instance.Status.Status = string(corev1.PodUnknown)
+
+	var pods = &corev1.PodList{}
+	var opts = &client.ListOptions{
+		Namespace: instance.GetNamespace(),
+	}
+	opts = opts.MatchingLabels(instance.Labels)
+	if err := r.List(context.TODO(), opts, pods); err != nil {
+		return reconcile.Result{}, nil
+	}
+
+	if len(pods.Items) == 0 {
+		return reconcile.Result{}, nil
+	}
+
+	// we only create one pod so only one should be found
+	var pod = pods.Items[0]
+	instance.Status.Status = string(pod.Status.Phase)
+	for _, cond := range pod.Status.ContainerStatuses {
+		if cond.State.Waiting != nil {
+			instance.Status.Status = cond.State.Waiting.Reason
+			break
 		}
 	}
-	return reconcile.Result{}, nil
+
+	log.Info(
+		"Updating Job Status",
+		"namespace", instance.Namespace,
+		"name", instance.Name,
+		"status", instance.Status,
+	)
+	return reconcile.Result{}, r.Status().Update(context.Background(), instance)
 }
