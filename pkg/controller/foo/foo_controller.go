@@ -29,8 +29,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
 	"sigs.k8s.io/controller-runtime/pkg/source"
@@ -81,6 +83,67 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 			return err
 		}
 	}
+
+	var mapFn = handler.ToRequestsFunc(
+		func(a handler.MapObject) []reconcile.Request {
+			var owners = a.Meta.GetOwnerReferences()
+			var requests []reconcile.Request
+			for _, owner := range owners {
+				var instance = &shipsv1beta1.Foo{}
+				if err = mgr.GetClient().Get(context.TODO(), client.ObjectKey{
+					Name:      owner.Name,
+					Namespace: a.Meta.GetNamespace(),
+				}, instance); err != nil {
+					log.Error(err, "failed to get foo instance")
+					return requests
+				}
+				log.Info("got foo", "name", instance.GetName())
+
+				var opts = &client.ListOptions{
+					Namespace: instance.GetNamespace(),
+				}
+				opts = opts.MatchingLabels(instance.Labels)
+
+				var pods = &corev1.PodList{}
+				if err := mgr.GetClient().List(context.TODO(), opts, pods); err != nil {
+					log.Error(err, "failed to get pods for job")
+					return requests
+				}
+
+				for _, po := range pods.Items {
+					log.Info("watching pod", "name", po.GetName())
+					requests = append(requests, reconcile.Request{
+						NamespacedName: types.NamespacedName{
+							Name:      po.GetName(),
+							Namespace: po.GetNamespace(),
+						},
+					})
+				}
+			}
+			return requests
+		},
+	)
+	if err := c.Watch(
+		&source.Kind{Type: &batchv1.Job{}},
+		&handler.EnqueueRequestsFromMapFunc{ToRequests: mapFn},
+		predicate.Funcs{
+			GenericFunc: func(e event.GenericEvent) bool {
+				return true
+			},
+			UpdateFunc: func(e event.UpdateEvent) bool {
+				return true
+			},
+			CreateFunc: func(e event.CreateEvent) bool {
+				return true
+			},
+			DeleteFunc: func(e event.DeleteEvent) bool {
+				return true
+			},
+		},
+	); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -92,9 +155,11 @@ type ReconcileFoo struct {
 	scheme *runtime.Scheme
 }
 
+// Reconcile reconciles.
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get
 // +kubebuilder:rbac:groups=,resources=pods,verbs=get;watch
+// +kubebuilder:rbac:groups=,resources=pods/status,verbs=get;watch
 // +kubebuilder:rbac:groups=ships.k8s.io,resources=foos,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=ships.k8s.io,resources=foos/status,verbs=get;update;patch
 func (r *ReconcileFoo) Reconcile(request reconcile.Request) (reconcile.Result, error) {
