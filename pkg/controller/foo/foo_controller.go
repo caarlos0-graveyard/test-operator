@@ -29,7 +29,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -73,7 +72,6 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	// watch all types we create...
 	for _, t := range []runtime.Object{
 		&batchv1.Job{},
-		&corev1.Pod{},
 	} {
 		err = c.Watch(&source.Kind{Type: t}, &handler.EnqueueRequestForOwner{
 			IsController: true,
@@ -86,36 +84,41 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 
 	var mapFn = handler.ToRequestsFunc(
 		func(a handler.MapObject) []reconcile.Request {
-			var owners = a.Meta.GetOwnerReferences()
+			log.Info("meta", "name", a.Meta.GetName(), "namespace", a.Meta.GetNamespace())
 			var requests []reconcile.Request
-			for _, owner := range owners {
-				var instance = &shipsv1beta1.Foo{}
+			for _, owner := range a.Meta.GetOwnerReferences() {
+				if owner.Kind != "Job" {
+					log.Info("owner is not a job", "kind", owner.Kind, "name", a.Meta.GetName(), "namespace", a.Meta.GetNamespace())
+					continue
+				}
+
+				var job = &batchv1.Job{}
 				if err = mgr.GetClient().Get(context.TODO(), client.ObjectKey{
 					Name:      owner.Name,
 					Namespace: a.Meta.GetNamespace(),
-				}, instance); err != nil {
-					log.Error(err, "failed to get foo instance")
-					return requests
-				}
-				log.Info("got foo", "name", instance.GetName())
-
-				var opts = &client.ListOptions{
-					Namespace: instance.GetNamespace(),
-				}
-				opts = opts.MatchingLabels(instance.Labels)
-
-				var pods = &corev1.PodList{}
-				if err := mgr.GetClient().List(context.TODO(), opts, pods); err != nil {
-					log.Error(err, "failed to get pods for job")
+				}, job); err != nil {
+					log.Error(err, "failed to get job", "name", owner.Name, "namespace", a.Meta.GetNamespace())
 					return requests
 				}
 
-				for _, po := range pods.Items {
-					log.Info("watching pod", "name", po.GetName())
+				for _, owner := range job.GetOwnerReferences() {
+					if owner.Kind != "Foo" {
+						log.Info("owner is not a foo", "name", a.Meta.GetName(), "namespace", a.Meta.GetNamespace())
+						continue
+					}
+
+					var instance = &shipsv1beta1.Foo{}
+					if err = mgr.GetClient().Get(context.TODO(), client.ObjectKey{
+						Name:      owner.Name,
+						Namespace: a.Meta.GetNamespace(),
+					}, instance); err != nil {
+						log.Error(err, "failed to get foo", "name", owner.Name, "namespace", a.Meta.GetNamespace())
+						continue
+					}
 					requests = append(requests, reconcile.Request{
 						NamespacedName: types.NamespacedName{
-							Name:      po.GetName(),
-							Namespace: po.GetNamespace(),
+							Name:      instance.Name,
+							Namespace: instance.Namespace,
 						},
 					})
 				}
@@ -124,22 +127,9 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 		},
 	)
 	if err := c.Watch(
-		&source.Kind{Type: &batchv1.Job{}},
+		&source.Kind{Type: &corev1.Pod{}},
 		&handler.EnqueueRequestsFromMapFunc{ToRequests: mapFn},
-		predicate.Funcs{
-			GenericFunc: func(e event.GenericEvent) bool {
-				return true
-			},
-			UpdateFunc: func(e event.UpdateEvent) bool {
-				return true
-			},
-			CreateFunc: func(e event.CreateEvent) bool {
-				return true
-			},
-			DeleteFunc: func(e event.DeleteEvent) bool {
-				return true
-			},
-		},
+		predicate.Funcs{},
 	); err != nil {
 		return err
 	}
@@ -206,8 +196,9 @@ func (r *ReconcileFoo) reconcileJob(instance *shipsv1beta1.Foo) (reconcile.Resul
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:  instance.Name,
-							Image: instance.Spec.Image,
+							Name:    instance.Name,
+							Image:   instance.Spec.Image,
+							Command: []string{"sh", "-c", "sleep 30"},
 						},
 					},
 					RestartPolicy: corev1.RestartPolicyNever,
@@ -238,9 +229,32 @@ func (r *ReconcileFoo) reconcileStatus(instance *shipsv1beta1.Foo) (reconcile.Re
 		"name", instance.Name,
 	)
 
+	status, err := r.getStatus(instance)
+	if err != nil {
+		log.Error(
+			err,
+			"failed to get Job Status",
+			"namespace", instance.Namespace,
+			"name", instance.Name,
+			"status", status,
+		)
+		return reconcile.Result{}, err
+	}
+	instance.Status.Status = status
+	log.Info(
+		"Updating Job Status",
+		"namespace", instance.Namespace,
+		"name", instance.Name,
+		"status", instance.Status,
+	)
+	return reconcile.Result{}, r.Status().Update(context.Background(), instance)
+}
+
+func (r *ReconcileFoo) getStatus(instance *shipsv1beta1.Foo) (string, error) {
+	var status string
 	var found = &batchv1.Job{}
 	if err := r.Get(context.TODO(), types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, found); err != nil {
-		return reconcile.Result{}, err
+		return status, err
 	}
 
 	for _, cond := range found.Status.Conditions {
@@ -249,50 +263,49 @@ func (r *ReconcileFoo) reconcileStatus(instance *shipsv1beta1.Foo) (reconcile.Re
 		}
 		switch cond.Type {
 		case batchv1.JobComplete:
-			instance.Status.Status = string(batchv1.JobComplete)
+			status = string(batchv1.JobComplete)
 		case batchv1.JobFailed:
-			instance.Status.Status = string(batchv1.JobFailed)
+			status = string(batchv1.JobFailed)
 		}
 		break
 	}
 
-	if instance.Status.Status != "" {
-		// means its either done or failed
-		return reconcile.Result{}, nil
+	if status != "" {
+		return status, nil
 	}
+
 	// otherwise its still running or trying to run, try to get pod status:
 
 	// set to unknown first
-	instance.Status.Status = string(corev1.PodUnknown)
+	status = string(corev1.PodUnknown)
 
 	var pods = &corev1.PodList{}
 	var opts = &client.ListOptions{
 		Namespace: instance.GetNamespace(),
 	}
 	opts = opts.MatchingLabels(instance.Labels)
+
 	if err := r.List(context.TODO(), opts, pods); err != nil {
-		return reconcile.Result{}, nil
+		return status, err
 	}
 
 	if len(pods.Items) == 0 {
-		return reconcile.Result{}, nil
+		log.Info(
+			"no pods found",
+			"namespace", instance.Namespace,
+			"name", instance.Name,
+		)
+		return status, nil
 	}
 
 	// we only create one pod so only one should be found
 	var pod = pods.Items[0]
-	instance.Status.Status = string(pod.Status.Phase)
+	status = string(pod.Status.Phase)
 	for _, cond := range pod.Status.ContainerStatuses {
 		if cond.State.Waiting != nil {
-			instance.Status.Status = cond.State.Waiting.Reason
+			status = cond.State.Waiting.Reason
 			break
 		}
 	}
-
-	log.Info(
-		"Updating Job Status",
-		"namespace", instance.Namespace,
-		"name", instance.Name,
-		"status", instance.Status,
-	)
-	return reconcile.Result{}, r.Status().Update(context.Background(), instance)
+	return status, nil
 }
