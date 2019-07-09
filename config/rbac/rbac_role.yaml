@@ -30,6 +30,13 @@ rules:
   - get
   - watch
 - apiGroups:
+  - ""
+  resources:
+  - pods/status
+  verbs:
+  - get
+  - watch
+- apiGroups:
   - ships.k8s.io
   resources:
   - foos

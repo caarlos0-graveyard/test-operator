@@ -2,6 +2,8 @@ apiVersion: ships.k8s.io/v1beta1
 kind: Foo
 metadata:
   name: should-be-fine
+  labels:
+    foo: works
 spec:
   image: ubuntu
 
@@ -11,5 +13,7 @@ apiVersion: ships.k8s.io/v1beta1
 kind: Foo
 metadata:
   name: image-dont-exist
+  labels:
+    foo: fails
 spec:
   image: ubuntuuu
